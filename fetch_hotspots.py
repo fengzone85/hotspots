@@ -2,14 +2,15 @@
 """
 三站热点日报自动抓取脚本
 - V2EX: 通过官方 API 获取热门话题
-- Linux.do: 通过 Discourse API 获取热门话题
-- NodeSeek: 通过页面抓取获取热门帖子
+- Linux.do: 通过 Discourse API + RSS 获取热门话题
+- NodeSeek: 通过 RSS Feed 获取最新帖子
 """
 
 import json
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -31,22 +32,70 @@ HEADERS = {
 }
 
 V2EX_API = "https://www.v2ex.com/api/topics/hot.json"
-LINUXDO_TOP_API = "https://linux.do/top.json"
-LINUXDO_LATEST_API = "https://linux.do/latest.json"
-NODESEEK_URL = "https://www.nodeseek.com"
+LINUXDO_TOP_API = "https://linux.do/top/weekly.json"
+LINUXDO_LATEST_API = "https://linux.do/latest.json?no_definitions=true"
+LINUXDO_RSS = "https://linux.do/top.rss?period=weekly"
+NODESEEK_RSS = "https://rss.nodeseek.com/"
 
 
-def fetch_with_retry(url, retries=3, timeout=15, **kwargs):
+def fetch_with_retry(url, retries=3, timeout=15, headers=None, **kwargs):
     """带重试的请求"""
+    req_headers = headers or HEADERS
     for i in range(retries):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=timeout, **kwargs)
+            resp = requests.get(url, headers=req_headers, timeout=timeout, **kwargs)
             resp.raise_for_status()
             return resp
         except requests.RequestException as e:
             print(f"  [重试 {i+1}/{retries}] 请求 {url} 失败: {e}")
             time.sleep(2)
     return None
+
+
+def parse_rss(xml_text):
+    """解析 RSS/Atom feed，返回条目列表"""
+    items = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return items
+
+    # RSS 2.0 格式
+    for item in root.iter("item"):
+        entry = {}
+        title_el = item.find("title")
+        link_el = item.find("link")
+        desc_el = item.find("description")
+        author_el = item.find("author")
+        pubdate_el = item.find("pubDate")
+
+        entry["title"] = title_el.text.strip() if title_el is not None and title_el.text else ""
+        entry["url"] = link_el.text.strip() if link_el is not None and link_el.text else ""
+        entry["desc"] = desc_el.text.strip()[:200] if desc_el is not None and desc_el.text else ""
+        entry["author"] = author_el.text.strip() if author_el is not None and author_el.text else ""
+        entry["pubDate"] = pubdate_el.text.strip() if pubdate_el is not None and pubdate_el.text else ""
+        if entry["title"]:
+            items.append(entry)
+
+    # Atom 格式
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    for entry in root.findall("atom:entry", ns):
+        item = {}
+        title_el = entry.find("atom:title", ns)
+        link_el = entry.find("atom:link", ns)
+        summary_el = entry.find("atom:summary", ns)
+        author_el = entry.find("atom:author/atom:name", ns)
+        updated_el = entry.find("atom:updated", ns)
+
+        item["title"] = title_el.text.strip() if title_el is not None and title_el.text else ""
+        item["url"] = link_el.get("href", "") if link_el is not None else ""
+        item["desc"] = summary_el.text.strip()[:200] if summary_el is not None and summary_el.text else ""
+        item["author"] = author_el.text.strip() if author_el is not None and author_el.text else ""
+        item["pubDate"] = updated_el.text.strip() if updated_el is not None and updated_el.text else ""
+        if item["title"]:
+            items.append(item)
+
+    return items
 
 
 # ========== V2EX ==========
@@ -108,38 +157,99 @@ def _fetch_v2ex_fallback():
 
 
 # ========== Linux.do ==========
+# Discourse 分类 ID 映射
+LINUXDO_CATEGORIES = {
+    4: "开发交流", 14: "资源分享", 42: "文档专区", 10: "跳蚤市场",
+    27: "职场天地", 32: "书友会", 46: "远航", 34: "新闻快讯",
+    92: "网络档案", 36: "福利", 11: "闲聊区", 2: "反馈",
+}
+
+
 def fetch_linuxdo_hot():
-    """通过 Discourse API 获取 Linux.do 热门话题"""
+    """通过 Discourse API 获取 Linux.do 热门话题（多级降级）"""
     print("📡 正在抓取 Linux.do 热门...")
+
+    # 方案1: Discourse JSON API（周热门）
+    results = _fetch_linuxdo_api()
+    if results:
+        return results
+
+    # 方案2: RSS Feed
+    results = _fetch_linuxdo_rss()
+    if results:
+        return results
+
+    # 方案3: latest API
+    results = _fetch_linuxdo_latest_api()
+    if results:
+        return results
+
+    print("  ❌ Linux.do 所有抓取方案均失败")
+    return []
+
+
+def _fetch_linuxdo_api():
+    """方案1: Discourse JSON API（周热门）"""
     resp = fetch_with_retry(LINUXDO_TOP_API)
     if not resp:
-        print("  ❌ Linux.do API 请求失败，尝试备用方案...")
-        return _fetch_linuxdo_fallback()
+        return []
 
     try:
         data = resp.json()
     except json.JSONDecodeError:
-        print("  ❌ Linux.do API 返回数据解析失败")
-        return _fetch_linuxdo_fallback()
+        return []
 
     topics = data.get("topic_list", {}).get("topics", [])
+    if not topics:
+        return []
+
     results = []
     for t in topics[:20]:
+        cat_id = t.get("category_id", "")
         results.append({
             "title": t.get("title", ""),
-            "category": t.get("category_id", ""),
-            "replies": t.get("posts_count", 0) - 1,  # posts_count 包含主帖
+            "category": LINUXDO_CATEGORIES.get(cat_id, str(cat_id)),
+            "replies": t.get("posts_count", 0) - 1,
             "views": t.get("views", 0),
             "url": f"https://linux.do/t/{t.get('slug', '')}/{t.get('id', '')}",
             "like_count": t.get("like_count", 0),
         })
 
-    print(f"  ✅ 获取到 {len(results)} 条 Linux.do 热门话题")
+    print(f"  ✅ (API) 获取到 {len(results)} 条 Linux.do 热门话题")
     return results
 
 
-def _fetch_linuxdo_fallback():
-    """Linux.do 备用方案：抓取 latest 页面"""
+def _fetch_linuxdo_rss():
+    """方案2: RSS Feed（周热门）"""
+    rss_headers = {
+        **HEADERS,
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+    }
+    resp = fetch_with_retry(LINUXDO_RSS, headers=rss_headers)
+    if not resp:
+        return []
+
+    items = parse_rss(resp.text)
+    if not items:
+        return []
+
+    results = []
+    for item in items[:20]:
+        results.append({
+            "title": item.get("title", ""),
+            "category": "",
+            "replies": 0,
+            "views": 0,
+            "url": item.get("url", ""),
+            "like_count": 0,
+        })
+
+    print(f"  ✅ (RSS) 获取到 {len(results)} 条 Linux.do 话题")
+    return results
+
+
+def _fetch_linuxdo_latest_api():
+    """方案3: latest API"""
     resp = fetch_with_retry(LINUXDO_LATEST_API)
     if not resp:
         return []
@@ -152,107 +262,99 @@ def _fetch_linuxdo_fallback():
 
     results = []
     for t in topics[:20]:
+        cat_id = t.get("category_id", "")
         results.append({
             "title": t.get("title", ""),
-            "category": t.get("category_id", ""),
+            "category": LINUXDO_CATEGORIES.get(cat_id, str(cat_id)),
             "replies": t.get("posts_count", 0) - 1,
             "views": t.get("views", 0),
             "url": f"https://linux.do/t/{t.get('slug', '')}/{t.get('id', '')}",
             "like_count": t.get("like_count", 0),
         })
 
-    print(f"  ✅ (备用) 获取到 {len(results)} 条 Linux.do 话题")
+    print(f"  ✅ (Latest API) 获取到 {len(results)} 条 Linux.do 话题")
     return results
 
 
 # ========== NodeSeek ==========
 def fetch_nodeseek_hot():
-    """抓取 NodeSeek 热门帖子"""
+    """通过 RSS Feed 获取 NodeSeek 最新帖子（多级降级）"""
     print("📡 正在抓取 NodeSeek 热门...")
-    resp = fetch_with_retry(NODESEEK_URL)
+
+    # 方案1: RSS Feed（最稳定，官方提供）
+    results = _fetch_nodeseek_rss()
+    if results:
+        return results
+
+    # 方案2: 页面抓取
+    results = _fetch_nodeseek_html()
+    if results:
+        return results
+
+    print("  ❌ NodeSeek 所有抓取方案均失败")
+    return []
+
+
+def _fetch_nodeseek_rss():
+    """方案1: RSS Feed"""
+    rss_headers = {
+        **HEADERS,
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+    }
+    resp = fetch_with_retry(NODESEEK_RSS, headers=rss_headers)
     if not resp:
-        print("  ❌ NodeSeek 页面请求失败")
+        return []
+
+    items = parse_rss(resp.text)
+    if not items:
+        return []
+
+    results = []
+    for item in items[:20]:
+        results.append({
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+            "replies": 0,
+            "category": "",
+            "author": item.get("author", ""),
+            "desc": item.get("desc", ""),
+        })
+
+    print(f"  ✅ (RSS) 获取到 {len(results)} 条 NodeSeek 话题")
+    return results
+
+
+def _fetch_nodeseek_html():
+    """方案2: 页面抓取（备用）"""
+    resp = fetch_with_retry("https://www.nodeseek.com")
+    if not resp:
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
     results = []
 
-    # 尝试多种选择器适配 NodeSeek 页面结构
-    # 方案1: 查找帖子列表
-    post_items = (
-        soup.select(".post-list-item")
-        or soup.select("[class*='post-item']")
-        or soup.select("[class*='topic']")
-        or soup.select("a[href*='/post-']")
-    )
-
-    if not post_items:
-        # 方案2: 查找所有含帖子链接的元素
-        links = soup.find_all("a", href=re.compile(r"/post-\d+"))
-        seen = set()
-        for link in links:
-            href = link.get("href", "")
-            if href in seen:
-                continue
-            seen.add(href)
-            title = link.get_text(strip=True)
-            if title and len(title) > 4:
-                results.append({
-                    "title": title,
-                    "url": f"https://www.nodeseek.com{href}" if href.startswith("/") else href,
-                    "replies": 0,
-                    "category": "",
-                })
-
-    for item in post_items[:20]:
-        title_el = item.select_one("a") or item
-        title = title_el.get_text(strip=True) if title_el else ""
-        href = title_el.get("href", "") if title_el and hasattr(title_el, "get") else ""
-        if not title:
+    # 查找所有含帖子链接的元素
+    links = soup.find_all("a", href=re.compile(r"/post-\d+"))
+    seen = set()
+    for link in links:
+        href = link.get("href", "")
+        if href in seen:
             continue
-        results.append({
-            "title": title,
-            "url": f"https://www.nodeseek.com{href}" if href.startswith("/") else href,
-            "replies": 0,
-            "category": "",
-        })
+        seen.add(href)
+        title = link.get_text(strip=True)
+        if title and len(title) > 4:
+            results.append({
+                "title": title,
+                "url": f"https://www.nodeseek.com{href}" if href.startswith("/") else href,
+                "replies": 0,
+                "category": "",
+                "author": "",
+                "desc": "",
+            })
 
-    # 如果以上方式都没获取到，尝试 API
-    if not results:
-        print("  ⚠️ 页面解析未获取到内容，尝试 NodeSeek API...")
-        results = _fetch_nodeseek_api()
-
-    print(f"  ✅ 获取到 {len(results)} 条 NodeSeek 话题")
+    if results:
+        print(f"  ✅ (HTML) 获取到 {len(results)} 条 NodeSeek 话题")
     return results
-
-
-def _fetch_nodeseek_api():
-    """尝试 NodeSeek 的可能 API 端点"""
-    api_urls = [
-        "https://www.nodeseek.com/api/posts?sort=hot",
-        "https://www.nodeseek.com/api/posts",
-    ]
-    for url in api_urls:
-        resp = fetch_with_retry(url)
-        if not resp:
-            continue
-        try:
-            data = resp.json()
-            items = data.get("data", data.get("posts", []))
-            if isinstance(items, list):
-                results = []
-                for item in items[:20]:
-                    results.append({
-                        "title": item.get("title", ""),
-                        "url": f"https://www.nodeseek.com/post-{item.get('id', '')}",
-                        "replies": item.get("comment_count", item.get("replies", 0)),
-                        "category": item.get("category", ""),
-                    })
-                if results:
-                    return results
-        except (json.JSONDecodeError, AttributeError):
-            continue
-    return []
 
 
 # ========== 报告生成 ==========
@@ -295,11 +397,12 @@ def generate_report(v2ex_data, linuxdo_data, nodeseek_data):
     if nodeseek_data:
         lines.append("### 🔥 热门话题")
         lines.append("")
-        lines.append("| # | 话题 | 分类 | 回复数 |")
-        lines.append("|---|------|------|--------|")
+        lines.append("| # | 话题 | 作者 |")
+        lines.append("|---|------|------|")
         for i, t in enumerate(nodeseek_data[:15], 1):
             title = t["title"].replace("|", "｜")
-            lines.append(f"| {i} | [{title}]({t['url']}) | {t.get('category', '-')} | {t.get('replies', '-')} |")
+            author = t.get("author", "")
+            lines.append(f"| {i} | [{title}]({t['url']}) | {author} |")
     else:
         lines.append("⚠️ 今日未能获取 NodeSeek 数据（该站可能有反爬机制）")
     lines.append("")
